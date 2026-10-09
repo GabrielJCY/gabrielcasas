@@ -1,6 +1,7 @@
 
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
 import { AnimatePresence, motion } from "framer-motion";
+
 import {
   Calculator,
   ArrowRight,
@@ -16,6 +17,18 @@ import Resultados from "./components/Resultados";
 
 import "./App.css";
 
+// ========================================
+// CONFIGURACIÓN DE LA API
+// ========================================
+
+const API_URL = import.meta.env.PROD
+  ? "https://gabrielcasas-backend.vercel.app"
+  : "http://127.0.0.1:8000";
+
+// ========================================
+// DATOS INICIALES
+// ========================================
+
 const viviendasIniciales = [
   { nombre: "Casa A", area: 80, distancia: 5, precio: 100000 },
   { nombre: "Casa B", area: 100, distancia: 3, precio: 130000 },
@@ -30,27 +43,60 @@ const pesosIniciales = {
   precio: 30,
 };
 
-const API_URL =
-  import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+// ========================================
+// COMPONENTE PRINCIPAL
+// ========================================
 
 export default function App() {
   // Navegación
   const [paginaActual, setPaginaActual] = useState("calculadora");
   const [contraido, setContraido] = useState(false);
 
-  // Datos
+  // Datos de viviendas
   const [viviendas, setViviendas] = useState(viviendasIniciales);
+
+  // Ponderaciones
   const [pesos, setPesos] = useState(pesosIniciales);
 
-  // Estado del cálculo
+  // Resultados
   const [resultado, setResultado] = useState(null);
   const [cargando, setCargando] = useState(false);
   const [error, setError] = useState("");
 
+  // Control de solicitudes HTTP
+  const solicitudActual = useRef(null);
+  const tiempoEspera = useRef(null);
+
+  // Cancelar solicitudes al desmontar el componente
+  useEffect(() => {
+    return () => {
+      solicitudActual.current?.abort();
+
+      if (tiempoEspera.current) {
+        clearTimeout(tiempoEspera.current);
+      }
+    };
+  }, []);
+
+  // ========================================
+  // INVALIDAR RESULTADOS
+  // ========================================
+
   const invalidarResultado = () => {
+    solicitudActual.current?.abort();
+
+    if (tiempoEspera.current) {
+      clearTimeout(tiempoEspera.current);
+    }
+
     setResultado(null);
     setError("");
+    setCargando(false);
   };
+
+  // ========================================
+  // VALIDAR DATOS
+  // ========================================
 
   const validarDatos = () => {
     if (viviendas.length < 5) {
@@ -100,7 +146,13 @@ export default function App() {
     return null;
   };
 
+  // ========================================
+  // CALCULAR MIN-MAX
+  // ========================================
+
   const calcular = async () => {
+    if (cargando) return;
+
     setError("");
 
     const mensajeError = validarDatos();
@@ -110,17 +162,28 @@ export default function App() {
       return;
     }
 
+    const controlador = new AbortController();
+    solicitudActual.current = controlador;
+
     setCargando(true);
     setResultado(null);
+
+    let timeoutAgotado = false;
+
+    tiempoEspera.current = setTimeout(() => {
+      timeoutAgotado = true;
+      controlador.abort();
+    }, 30000);
 
     try {
       const datos = {
         viviendas: viviendas.map((v) => ({
-          nombre: v.nombre.trim(),
+          nombre: String(v.nombre).trim(),
           area: Number(v.area),
           distancia: Number(v.distancia),
           precio: Number(v.precio),
         })),
+
         peso_area: Number(pesos.area) / 100,
         peso_distancia: Number(pesos.distancia) / 100,
         peso_precio: Number(pesos.precio) / 100,
@@ -128,15 +191,34 @@ export default function App() {
 
       const respuesta = await fetch(`${API_URL}/calcular`, {
         method: "POST",
+
         headers: {
           "Content-Type": "application/json",
+          Accept: "application/json",
         },
+
         body: JSON.stringify(datos),
+        signal: controlador.signal,
       });
 
       if (!respuesta.ok) {
+        let detalle = "";
+
+        try {
+          const contenido = await respuesta.json();
+
+          if (typeof contenido.detail === "string") {
+            detalle = contenido.detail;
+          }
+        } catch {
+          // Si el servidor no responde JSON,
+          // conservamos el código HTTP.
+        }
+
         throw new Error(
-          `Error HTTP ${respuesta.status}. No se pudo calcular.`
+          `Error HTTP ${respuesta.status}. ${
+            detalle || "El servidor no pudo procesar la solicitud."
+          }`
         );
       }
 
@@ -144,21 +226,57 @@ export default function App() {
 
       if (
         !Array.isArray(resultadoAPI.resultados) ||
+        resultadoAPI.resultados.length === 0 ||
         !resultadoAPI.mejor_vivienda
       ) {
-        throw new Error("El servidor devolvió un resultado no válido.");
+        throw new Error(
+          "El servidor devolvió un resultado no válido."
+        );
       }
+
+      // Evitar mostrar una respuesta cancelada
+      if (controlador.signal.aborted) return;
 
       setResultado(resultadoAPI);
       setPaginaActual("resultados");
     } catch (err) {
-      setError(
-        `${err.message} Comprueba que FastAPI esté ejecutándose en el puerto 8000.`
-      );
+      if (controlador.signal.aborted && !timeoutAgotado) {
+        return;
+      }
+
+      console.error("Error al calcular MIN-MAX:", err);
+      console.error("Endpoint:", `${API_URL}/calcular`);
+
+      if (timeoutAgotado) {
+        setError(
+          "El servidor tardó demasiado en responder. Intenta nuevamente."
+        );
+      } else if (err instanceof TypeError) {
+        setError(
+          "No se pudo establecer conexión con la API. " +
+          "Comprueba tu conexión a Internet o la configuración del servidor."
+        );
+      } else {
+        setError(
+          err.message || "Ocurrió un error inesperado."
+        );
+      }
     } finally {
-      setCargando(false);
+      if (tiempoEspera.current) {
+        clearTimeout(tiempoEspera.current);
+        tiempoEspera.current = null;
+      }
+
+      if (solicitudActual.current === controlador) {
+        solicitudActual.current = null;
+        setCargando(false);
+      }
     }
   };
+
+  // ========================================
+  // INTERFAZ DEL DASHBOARD
+  // ========================================
 
   return (
     <DashboardLayout
@@ -168,6 +286,11 @@ export default function App() {
       setContraido={setContraido}
     >
       <AnimatePresence mode="wait">
+
+        {/* ========================================
+            PÁGINA CALCULADORA
+        ======================================== */}
+
         {paginaActual === "calculadora" && (
           <motion.div
             key="calculadora"
@@ -175,8 +298,13 @@ export default function App() {
             initial={{ opacity: 0, y: 12 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -12 }}
-            transition={{ duration: 0.3 }}
+            transition={{
+              duration: 0.3,
+              ease: "easeOut",
+            }}
           >
+            {/* INTRODUCCIÓN */}
+
             <div className="calculadora-intro glass">
               <div className="calculadora-intro-icon">
                 <Calculator size={24} />
@@ -184,9 +312,10 @@ export default function App() {
 
               <div className="calculadora-intro-text">
                 <h2>Evaluación de viviendas</h2>
+
                 <p>
-                  Introduce los datos, configura tus prioridades y
-                  descubre la mejor alternativa.
+                  Introduce los datos, configura tus prioridades
+                  y descubre la mejor alternativa.
                 </p>
               </div>
 
@@ -195,11 +324,15 @@ export default function App() {
               </span>
             </div>
 
+            {/* PONDERACIONES */}
+
             <Ponderaciones
               pesos={pesos}
               setPesos={setPesos}
               onChange={invalidarResultado}
             />
+
+            {/* FORMULARIO DE VIVIENDAS */}
 
             <ViviendaForm
               viviendas={viviendas}
@@ -207,24 +340,41 @@ export default function App() {
               onChange={invalidarResultado}
             />
 
-            <div className="calculadora-actions">
-              {error && (
-                <motion.div
-                  className="calculadora-error"
-                  role="alert"
-                  initial={{ opacity: 0, y: -8 }}
-                  animate={{ opacity: 1, y: 0 }}
-                >
-                  <AlertCircle size={20} />
-                  <span>{error}</span>
-                </motion.div>
-              )}
+            {/* ACCIONES */}
 
-              <button
+            <div className="calculadora-actions">
+
+              {/* MENSAJE DE ERROR */}
+
+              <AnimatePresence>
+                {error && (
+                  <motion.div
+                    className="calculadora-error"
+                    role="alert"
+                    initial={{ opacity: 0, y: -8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -8 }}
+                    transition={{ duration: 0.2 }}
+                  >
+                    <AlertCircle size={20} />
+                    <span>{error}</span>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              {/* BOTÓN CALCULAR */}
+
+              <motion.button
                 type="button"
                 className="calcular-button"
                 onClick={calcular}
                 disabled={cargando}
+                whileHover={
+                  cargando ? {} : { scale: 1.02 }
+                }
+                whileTap={
+                  cargando ? {} : { scale: 0.98 }
+                }
               >
                 {cargando ? (
                   <>
@@ -241,14 +391,19 @@ export default function App() {
                     <ArrowRight size={20} />
                   </>
                 )}
-              </button>
+              </motion.button>
 
               <p className="calculadora-note">
-                Los cálculos se realizan mediante Python y FastAPI.
+                Cálculos realizados mediante Python y FastAPI.
               </p>
+
             </div>
           </motion.div>
         )}
+
+        {/* ========================================
+            PÁGINA RESULTADOS
+        ======================================== */}
 
         {paginaActual === "resultados" && (
           <Resultados
@@ -258,6 +413,10 @@ export default function App() {
           />
         )}
 
+        {/* ========================================
+            PÁGINA MÉTODO MIN-MAX
+        ======================================== */}
+
         {paginaActual === "metodo" && (
           <motion.div
             key="metodo"
@@ -265,23 +424,34 @@ export default function App() {
             initial={{ opacity: 0, y: 12 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -12 }}
-            transition={{ duration: 0.3 }}
+            transition={{
+              duration: 0.3,
+              ease: "easeOut",
+            }}
           >
             <div className="metodo-intro">
               <BookOpen size={25} />
 
               <div>
                 <h2>¿Cómo funciona MIN-MAX?</h2>
+
                 <p>
-                  La normalización transforma los datos originales
-                  a una escala comparable entre 0 y 1.
+                  La normalización transforma los datos
+                  originales a una escala comparable
+                  entre 0 y 1.
                 </p>
               </div>
             </div>
 
+            {/* FÓRMULAS */}
+
             <div className="metodo-formulas">
+
+              {/* MAX */}
+
               <div className="metodo-formula">
                 <span>MAX — Criterio de beneficio</span>
+
                 <h3>Área</h3>
 
                 <div className="formula-matematica">
@@ -289,13 +459,16 @@ export default function App() {
                 </div>
 
                 <p>
-                  Cuanto mayor sea el área, mejor será el valor
-                  normalizado.
+                  Cuanto mayor sea el área,
+                  mejor será el valor normalizado.
                 </p>
               </div>
 
+              {/* MIN */}
+
               <div className="metodo-formula">
                 <span>MIN — Criterio de costo</span>
+
                 <h3>Distancia y precio</h3>
 
                 <div className="formula-matematica">
@@ -307,14 +480,18 @@ export default function App() {
                   mejor será el valor normalizado.
                 </p>
               </div>
+
             </div>
+
+            {/* PUNTAJE PONDERADO */}
 
             <div className="metodo-puntaje">
               <h3>Puntaje ponderado</h3>
 
               <p>
-                Se multiplica cada valor normalizado por su peso
-                correspondiente y se suman los resultados.
+                Se multiplica cada valor normalizado por
+                su peso correspondiente y se suman
+                los resultados.
               </p>
 
               <div className="formula-matematica">
@@ -323,18 +500,20 @@ export default function App() {
               </div>
 
               <p>
-                La vivienda con mayor puntaje final será la
-                mejor alternativa según las prioridades elegidas.
+                La vivienda con mayor puntaje final
+                será la mejor alternativa según las
+                prioridades elegidas.
               </p>
 
               <p>
-                Si todos los valores de un criterio son iguales,
-                nuestro backend asigna 1 a todas las viviendas
-                para evitar una división entre cero.
+                Si todos los valores de un criterio son
+                iguales, el backend asigna 1 a todas las
+                viviendas para evitar una división entre cero.
               </p>
             </div>
           </motion.div>
         )}
+
       </AnimatePresence>
     </DashboardLayout>
   );
